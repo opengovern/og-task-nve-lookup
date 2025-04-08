@@ -326,8 +326,7 @@ func RunTask(ctx context.Context, jq *jq.JobQueue, coreServiceEndpoint string, e
 		log.Println("DEBUG: All workers finished, closing results channel.")
 		close(results)
 	}()
-	processedResults := processResults(ctx, results)
-	outputFinalJSONArray(esClient, request, processedResults)
+	processedResults := processResults(esClient, request, ctx, results)
 	errorCount := 0
 	for _, res := range processedResults {
 		if res.Error != nil {
@@ -458,7 +457,7 @@ func limitString(s string, maxLen int) string {
 }
 
 // --- Result Processing (MODIFIED LOGGING) ---
-func processResults(ctx context.Context, results <-chan CVEProcessingResult) []CVEProcessingResult {
+func processResults(esClient opengovernance.Client, request tasks.TaskRequest, ctx context.Context, results <-chan CVEProcessingResult) []CVEProcessingResult {
 	processedResults := make([]CVEProcessingResult, 0)
 	log.Println("INFO: Waiting to process results...")
 	for {
@@ -470,30 +469,17 @@ func processResults(ctx context.Context, results <-chan CVEProcessingResult) []C
 				return processedResults
 			}
 			if result.Error != nil {
-				// MODIFIED: Use uppercase ID in error log
-				log.Printf("ERROR: Failed processing CVE %s: %v", strings.ToUpper(result.InputCVEID), result.Error)
+				log.Printf("WARN: Failed to send result for %s: %v", result.InputCVEID, result.Error)
+			} else if result.Output != nil {
+				err := sendCveDetails(esClient, request, result.Output)
+				if err != nil {
+					log.Printf("ERROR: Failed to send result for %s: %v", result.InputCVEID, err)
+				}
 			}
-			processedResults = append(processedResults, result)
 		case <-ctx.Done():
 			log.Printf("WARN: Context cancelled while processing results. Output may be incomplete: %v", ctx.Err())
 			sort.Slice(processedResults, func(i, j int) bool { return processedResults[i].InputCVEID < processedResults[j].InputCVEID })
 			return processedResults
-		}
-	}
-}
-
-// --- Final Output (Unchanged) ---
-func outputFinalJSONArray(esClient opengovernance.Client, request tasks.TaskRequest, results []CVEProcessingResult) {
-	for _, res := range results {
-		if res.Error != nil {
-			log.Printf("WARN: Failed to send result for %s: %v", res.InputCVEID, res.Error)
-			continue
-		}
-		if res.Output != nil {
-			err := sendCveDetails(esClient, request, res.Output)
-			if err != nil {
-				log.Printf("ERROR: Failed to send result for %s: %v", res.InputCVEID, err)
-			}
 		}
 	}
 }
