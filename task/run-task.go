@@ -19,7 +19,7 @@ import (
 	"golang.org/x/net/context"
 	"golang.org/x/time/rate"
 	"io"
-	"log/slog"
+	"log"
 	"math"
 	"net/http"
 	"os"
@@ -36,11 +36,11 @@ import (
 // --- Configuration ---
 
 const (
-	appName          = "nvd_lookup_enterprise"
-	appVersion       = "2.3" // Incremented version
+	appName          = "nvd_transformer"
+	appVersion       = "3.2" // Version reflecting uppercase log fix
 	nvdBaseURL       = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 	maxCLIInputCVEs  = 5
-	maxJSONInputCVEs = 1000
+	maxFileInputCVEs = 1000
 	stdinIndicator   = "-"
 )
 
@@ -55,40 +55,27 @@ const (
 	defaultRateLimitPeriodSec   = 30
 )
 
-var defaultMetricPriorities = map[string]int{"v4.0": 100, "v3.1": 90, "v2.0": 80}
+var cveRegex = regexp.MustCompile(`^cve-\d{4}-\d{4,}$`)
 
-// Regex for basic CVE ID format validation (case-insensitive flag added implicitly by ToLower)
-var cveRegex = regexp.MustCompile(`^cve-\d{4}-\d{4,}$`) // Expect lowercase input now
-
-// --- Configuration Struct & Variables ---
 type Config struct {
-	NvdApiKey            string         `mapstructure:"nvdApiKey"`
-	LogLevel             string         `mapstructure:"logLevel"`
-	MaxConcurrentFetches int            `mapstructure:"maxConcurrentFetches"`
-	RequestTimeoutSec    int            `mapstructure:"requestTimeoutSec"`
-	MaxRetries           int            `mapstructure:"maxRetries"`
-	InitialBackoffSec    int            `mapstructure:"initialBackoffSec"`
-	RateLimitRequests    float64        `mapstructure:"rateLimitRequests"`
-	RateLimitPeriodSec   int            `mapstructure:"rateLimitPeriodSec"`
-	MetricPriorities     map[string]int `mapstructure:"metricPriorities"`
+	NvdApiKey            string  `mapstructure:"nvdApiKey"`
+	LogLevel             string  `mapstructure:"logLevel"`
+	MaxConcurrentFetches int     `mapstructure:"maxConcurrentFetches"`
+	RequestTimeoutSec    int     `mapstructure:"requestTimeoutSec"`
+	MaxRetries           int     `mapstructure:"maxRetries"`
+	InitialBackoffSec    int     `mapstructure:"initialBackoffSec"`
+	RateLimitRequests    float64 `mapstructure:"rateLimitRequests"`
+	RateLimitPeriodSec   int     `mapstructure:"rateLimitPeriodSec"`
 }
 
 var (
-	cfg              Config                 // Holds loaded configuration
-	logger           *slog.Logger           // Global structured logger
-	httpClient       *http.Client           // Reusable HTTP client
-	sortedPriorities []MetricPriorityConfig // Sorted priorities after validation
-	userAgent        string                 // Dynamically set user agent
+	cfg        Config
+	httpClient *http.Client
+	userAgent  string
 )
 
-// --- Weighted Priority Config Struct ---
-type MetricPriorityConfig struct {
-	Version string
-	Weight  int
-}
-
-// --- Input/Output Struct Definitions ---
-// (Struct definitions are identical to the previous version)
+// --- Input Struct Definitions (NVD API Format - camelCase) ---
+// --- Unchanged ---
 type InputNVDResponse struct {
 	Vulnerabilities []InputVulnerability `json:"vulnerabilities"`
 }
@@ -102,12 +89,12 @@ type InputCVE struct {
 	LastModified          string             `json:"lastModified"`
 	VulnStatus            string             `json:"vulnStatus"`
 	Descriptions          []InputDescription `json:"descriptions"`
-	Metrics               InputMetrics       `json:"metrics"`
+	Metrics               *InputMetrics      `json:"metrics"`
 	Weaknesses            []InputWeakness    `json:"weaknesses"`
-	CisaExploitAdd        string             `json:"cisaExploitAdd,omitempty"`
-	CisaActionDue         string             `json:"cisaActionDue,omitempty"`
-	CisaRequiredAction    string             `json:"cisaRequiredAction,omitempty"`
-	CisaVulnerabilityName string             `json:"cisaVulnerabilityName,omitempty"`
+	CisaExploitAdd        *string            `json:"cisaExploitAdd"`
+	CisaActionDue         *string            `json:"cisaActionDue"`
+	CisaRequiredAction    *string            `json:"cisaRequiredAction"`
+	CisaVulnerabilityName *string            `json:"cisaVulnerabilityName"`
 }
 type InputDescription struct {
 	Lang  string `json:"lang"`
@@ -124,42 +111,21 @@ type InputCvssMetricV40 struct {
 	CvssData InputCvssDataV40 `json:"cvssData"`
 }
 type InputCvssDataV40 struct {
-	Version                           string  `json:"version"`
-	VectorString                      string  `json:"vectorString"`
-	BaseScore                         float64 `json:"baseScore"`
-	BaseSeverity                      string  `json:"baseSeverity"`
-	AttackVector                      string  `json:"attackVector"`
-	AttackComplexity                  string  `json:"attackComplexity"`
-	AttackRequirements                string  `json:"attackRequirements"`
-	PrivilegesRequired                string  `json:"privilegesRequired"`
-	UserInteraction                   string  `json:"userInteraction"`
-	VulnConfidentialityImpact         string  `json:"vulnConfidentialityImpact"`
-	VulnIntegrityImpact               string  `json:"vulnIntegrityImpact"`
-	VulnAvailabilityImpact            string  `json:"vulnAvailabilityImpact"`
-	SubConfidentialityImpact          string  `json:"subConfidentialityImpact"`
-	SubIntegrityImpact                string  `json:"subIntegrityImpact"`
-	SubAvailabilityImpact             string  `json:"subAvailabilityImpact"`
-	ExploitMaturity                   string  `json:"exploitMaturity"`
-	ConfidentialityRequirement        string  `json:"confidentialityRequirement"`
-	IntegrityRequirement              string  `json:"integrityRequirement"`
-	AvailabilityRequirement           string  `json:"availabilityRequirement"`
-	ModifiedAttackVector              string  `json:"modifiedAttackVector"`
-	ModifiedAttackComplexity          string  `json:"modifiedAttackComplexity"`
-	ModifiedAttackRequirements        string  `json:"modifiedAttackRequirements"`
-	ModifiedPrivilegesRequired        string  `json:"modifiedPrivilegesRequired"`
-	ModifiedUserInteraction           string  `json:"modifiedUserInteraction"`
-	ModifiedVulnConfidentialityImpact string  `json:"modifiedVulnConfidentialityImpact"`
-	ModifiedVulnIntegrityImpact       string  `json:"modifiedVulnIntegrityImpact"`
-	ModifiedVulnAvailabilityImpact    string  `json:"modifiedVulnAvailabilityImpact"`
-	ModifiedSubConfidentialityImpact  string  `json:"modifiedSubConfidentialityImpact"`
-	ModifiedSubIntegrityImpact        string  `json:"modifiedSubIntegrityImpact"`
-	ModifiedSubAvailabilityImpact     string  `json:"modifiedSubAvailabilityImpact"`
-	Safety                            string  `json:"Safety"`
-	Automatable                       string  `json:"Automatable"`
-	Recovery                          string  `json:"Recovery"`
-	ValueDensity                      string  `json:"valueDensity"`
-	VulnerabilityResponseEffort       string  `json:"vulnerabilityResponseEffort"`
-	ProviderUrgency                   string  `json:"providerUrgency"`
+	Version                   string  `json:"version"`
+	VectorString              string  `json:"vectorString"`
+	BaseScore                 float64 `json:"baseScore"`
+	BaseSeverity              string  `json:"baseSeverity"`
+	AttackVector              string  `json:"attackVector"`
+	AttackComplexity          string  `json:"attackComplexity"`
+	AttackRequirements        string  `json:"attackRequirements"`
+	PrivilegesRequired        string  `json:"privilegesRequired"`
+	UserInteraction           string  `json:"userInteraction"`
+	VulnConfidentialityImpact string  `json:"vulnConfidentialityImpact"`
+	VulnIntegrityImpact       string  `json:"vulnIntegrityImpact"`
+	VulnAvailabilityImpact    string  `json:"vulnAvailabilityImpact"`
+	SubConfidentialityImpact  string  `json:"subConfidentialityImpact"`
+	SubIntegrityImpact        string  `json:"subIntegrityImpact"`
+	SubAvailabilityImpact     string  `json:"subAvailabilityImpact"`
 }
 type InputCvssMetricV31 struct {
 	Source              string           `json:"source"`
@@ -212,35 +178,90 @@ type InputWeakness struct {
 	Description []InputDescription `json:"description"`
 }
 
-type OutputDescription struct {
-	Lang  string `json:"lang"`
-	Value string `json:"value"`
+type TargetCvssMetricV2 struct {
+	Source                  string           `json:"source"`
+	Type                    string           `json:"type"`
+	CvssData                TargetCvssDataV2 `json:"cvss_data"`
+	ExploitabilityScore     float64          `json:"exploitability_score"`
+	ImpactScore             float64          `json:"impact_score"`
+	AcInsufInfo             bool             `json:"ac_insuf_info"`
+	ObtainAllPrivilege      bool             `json:"obtain_all_privilege"`
+	ObtainUserPrivilege     bool             `json:"obtain_user_privilege"`
+	ObtainOtherPrivilege    bool             `json:"obtain_other_privilege"`
+	UserInteractionRequired bool             `json:"user_interaction_required"`
 }
-type OutputMetrics struct {
-	CvssMetricV40 []InputCvssMetricV40 `json:"cvssMetricV40,omitempty"`
-	CvssMetricV31 []InputCvssMetricV31 `json:"cvssMetricV31,omitempty"`
-	CvssMetricV2  []InputCvssMetricV2  `json:"cvssMetricV2,omitempty"`
+type TargetCvssDataV2 struct {
+	Version               string  `json:"version"`
+	VectorString          string  `json:"vector_string"`
+	AccessVector          string  `json:"access_vector"`
+	AccessComplexity      string  `json:"access_complexity"`
+	Authentication        string  `json:"authentication"`
+	ConfidentialityImpact string  `json:"confidentiality_impact"`
+	IntegrityImpact       string  `json:"integrity_impact"`
+	AvailabilityImpact    string  `json:"availability_impact"`
+	BaseScore             float64 `json:"base_score"`
+	BaseSeverity          string  `json:"base_severity"` // Moved inside
 }
-type OutputWeakness struct {
-	Source      string              `json:"source"`
-	Type        string              `json:"type"`
-	Description []OutputDescription `json:"description"`
+type TargetCvssMetricV31 struct {
+	Source              string            `json:"source"`
+	Type                string            `json:"type"`
+	CvssData            TargetCvssDataV31 `json:"cvss_data"`
+	ExploitabilityScore float64           `json:"exploitability_score"`
+	ImpactScore         float64           `json:"impact_score"`
+}
+type TargetCvssDataV31 struct {
+	Version               string  `json:"version"`
+	VectorString          string  `json:"vector_string"`
+	AttackVector          string  `json:"attack_vector"`
+	AttackComplexity      string  `json:"attack_complexity"`
+	PrivilegesRequired    string  `json:"privileges_required"`
+	UserInteraction       string  `json:"user_interaction"`
+	Scope                 string  `json:"scope"`
+	ConfidentialityImpact string  `json:"confidentiality_impact"`
+	IntegrityImpact       string  `json:"integrity_impact"`
+	AvailabilityImpact    string  `json:"availability_impact"`
+	BaseScore             float64 `json:"base_score"`
+	BaseSeverity          string  `json:"base_severity"`
+}
+type TargetCvssMetricV40 struct {
+	Source   string            `json:"source"`
+	Type     string            `json:"type"`
+	CvssData TargetCvssDataV40 `json:"cvss_data"`
+}
+type TargetCvssDataV40 struct {
+	Version                   string  `json:"version"`
+	VectorString              string  `json:"vector_string"`
+	BaseScore                 float64 `json:"base_score"`
+	BaseSeverity              string  `json:"base_severity"`
+	AttackVector              string  `json:"attack_vector"`
+	AttackComplexity          string  `json:"attack_complexity"`
+	AttackRequirements        string  `json:"attack_requirements"`
+	PrivilegesRequired        string  `json:"privileges_required"`
+	UserInteraction           string  `json:"user_interaction"`
+	VulnConfidentialityImpact string  `json:"vuln_confidentiality_impact"`
+	VulnIntegrityImpact       string  `json:"vuln_integrity_impact"`
+	VulnAvailabilityImpact    string  `json:"vuln_availability_impact"`
+	SubConfidentialityImpact  string  `json:"sub_confidentiality_impact"`
+	SubIntegrityImpact        string  `json:"sub_integrity_impact"`
+	SubAvailabilityImpact     string  `json:"sub_availability_impact"`
+}
+type TargetWeakness struct {
+	Source      string             `json:"source"`
+	Type        string             `json:"type"`
+	Description []InputDescription `json:"description"` // Re-use InputDescription
 }
 
-// Result struct for worker communication
+// --- Result struct for worker communication (Unchanged) ---
 type CVEProcessingResult struct {
-	CVEID  string
-	Output *OutputCVE
-	Error  error
+	InputCVEID string // The original requested ID (lowercase)
+	Output     *TargetCve
+	Error      error
 }
 
-// --- Initialization ---
-
+// --- Initialization (Unchanged) ---
 func init() {
-	setupLoggerDefault()
+	log.SetFlags(log.LstdFlags | log.Lshortfile | log.Lmicroseconds) // Added microseconds
 	loadConfig()
-	setupLoggerWithConfig()
-	validateAndSortPriorities()
 	setupHTTPClient()
 	setUserAgent()
 }
@@ -252,7 +273,7 @@ func RunTask(ctx context.Context, jq *jq.JobQueue, coreServiceEndpoint string, e
 	var rawCveIDs []string
 	var err error
 
-	logger.Info("Fetching SBOMs for task")
+	log.Printf("Fetching SBOMs for task")
 	inventoryClient := coreClient.NewCoreServiceClient(coreServiceEndpoint)
 
 	if queryID, ok := request.TaskDefinition.Params["query_id"].(string); ok && queryID != "" {
@@ -262,240 +283,147 @@ func RunTask(ctx context.Context, jq *jq.JobQueue, coreServiceEndpoint string, e
 	} else {
 		err = fmt.Errorf("SBOM source query not provided (missing 'query_id' or 'query_to_execute' in params)")
 	}
-
 	if err != nil {
-		logger.Error("Failed to fetch SBOMs", zap.Error(err))
+		log.Printf("Error fetching SBOMs for task: %v", err)
 		return err
 	}
-	if len(rawCveIDs) == 0 {
-		logger.Info("No cve found matching query.")
-		response.Result = json.RawMessage(`{"sboms_done_number":0, "sboms_succeeded_number":0, "sboms":[]}`)
-		return nil
-	}
 
-	logger.Info("Processing packages for artifacts", zap.Strings("cve_ids", rawCveIDs))
-
-	logger = logger.With("app_version", appVersion)
-	logger.Info("Application starting")
-
+	log.Printf("INFO: %s starting (version %s)", appName, appVersion)
 	apiKey := "3cdacd44-7beb-4282-b836-7ad567c68147"
-	cveIDs := validateCVEInput(rawCveIDs)
-
-	logger.Info("Processing validated CVE IDs", "count", len(cveIDs))
-
+	cveIDs := getAndValidateCVEInput(rawCveIDs)
+	if len(cveIDs) == 0 {
+		log.Println("INFO: No valid CVE IDs to process. Exiting.")
+		os.Exit(0)
+	}
+	log.Printf("INFO: Processing %d validated CVE IDs", len(cveIDs))
 	limit := rate.Limit(cfg.RateLimitRequests / float64(cfg.RateLimitPeriodSec))
 	limiter := rate.NewLimiter(limit, cfg.MaxConcurrentFetches)
-	logger.Info("NVD rate limiter configured", slog.Float64("rate_per_sec", float64(limit)), slog.Int("burst", cfg.MaxConcurrentFetches))
-
+	log.Printf("INFO: NVD rate limiter configured (rate: %.2f/sec, burst: %d)", float64(limit), cfg.MaxConcurrentFetches)
 	jobs := make(chan string, len(cveIDs))
 	results := make(chan CVEProcessingResult, len(cveIDs))
 	var wg sync.WaitGroup
-
-	logger.Info("Starting worker goroutines", "count", cfg.MaxConcurrentFetches)
+	log.Printf("INFO: Starting %d worker goroutines", cfg.MaxConcurrentFetches)
 	for w := 1; w <= cfg.MaxConcurrentFetches; w++ {
 		wg.Add(1)
-		go worker(ctx, logger.With("worker_id", w), w, jobs, results, &wg, apiKey, limiter)
+		go worker(ctx, w, jobs, results, &wg, apiKey, limiter)
 	}
-
 	go func() {
 		defer close(jobs)
-		logger.Debug("Starting job submission")
+		log.Println("DEBUG: Starting job submission")
 		for _, cveID := range cveIDs {
 			select {
 			case jobs <- cveID:
-				logger.Debug("Submitted job", "cve_id", cveID)
 			case <-ctx.Done():
-				logger.Warn("Context cancelled during job submission", "error", ctx.Err())
+				log.Printf("WARN: Context cancelled during job submission: %v", ctx.Err())
 				return
 			}
 		}
-		logger.Debug("Finished job submission")
+		log.Println("DEBUG: Finished job submission")
 	}()
-
 	go func() {
-		logger.Debug("Waiting for workers to finish...")
+		log.Println("DEBUG: Waiting for workers to finish...")
 		wg.Wait()
-		logger.Debug("All workers finished, closing results channel.")
+		log.Println("DEBUG: All workers finished, closing results channel.")
 		close(results)
 	}()
-
-	errorCount := processResults(ctx, esClient, request, results)
-
-	logger.Info("Processing complete", "successful_count", len(cveIDs)-errorCount, "failed_count", errorCount)
-
-	if errorCount > 0 {
-		logger.Error("Completed with errors.")
+	processedResults := processResults(ctx, results)
+	outputFinalJSONArray(esClient, request, processedResults)
+	errorCount := 0
+	for _, res := range processedResults {
+		if res.Error != nil {
+			errorCount++
+		}
 	}
-	logger.Info("Completed successfully.")
+	log.Printf("INFO: Processing complete (Successful: %d, Failed: %d)", len(processedResults)-errorCount, errorCount)
+	if errorCount > 0 {
+		log.Println("ERROR: Completed with errors.")
+		os.Exit(1)
+	}
+	log.Println("INFO: Completed successfully.")
 	return nil
 }
 
-// --- Setup Functions ---
-
-func setupLoggerDefault() {
-	opts := slog.HandlerOptions{Level: slog.LevelInfo}
-	handler := slog.NewJSONHandler(os.Stderr, &opts)
-	logger = slog.New(handler).With("app", appName)
-	slog.SetDefault(logger)
-}
-
-func setupLoggerWithConfig() {
-	var logLevel slog.Level
-	switch strings.ToLower(cfg.LogLevel) {
-	case "debug":
-		logLevel = slog.LevelDebug
-	case "info":
-		logLevel = slog.LevelInfo
-	case "warn":
-		logLevel = slog.LevelWarn
-	case "error":
-		logLevel = slog.LevelError
-	default:
-		logLevel = slog.LevelInfo
-		logger.Warn("Invalid logLevel in config, using default 'info'", "configured_level", cfg.LogLevel)
-	}
-	opts := slog.HandlerOptions{Level: logLevel}
-	handler := slog.NewJSONHandler(os.Stderr, &opts)
-	logger = slog.New(handler).With("app", appName)
-	slog.SetDefault(logger)
-	logger.Info("Structured logging re-initialized", "level", logLevel.String())
-}
-
+// --- Configuration Loading (Unchanged) ---
 func loadConfig() {
 	viper.SetConfigName("config")
 	viper.SetConfigType("yaml")
 	viper.AddConfigPath(".")
 	viper.AddConfigPath("$HOME/.config/" + appName)
 	viper.AddConfigPath("/etc/" + appName)
-
-	// Set defaults explicitly
 	viper.SetDefault("nvdApiKey", "")
+	viper.SetDefault("logLevel", defaultLogLevel)
 	viper.SetDefault("maxConcurrentFetches", defaultMaxConcurrentFetches)
 	viper.SetDefault("requestTimeoutSec", defaultRequestTimeoutSec)
 	viper.SetDefault("maxRetries", defaultMaxRetries)
 	viper.SetDefault("initialBackoffSec", defaultInitialBackoffSec)
 	viper.SetDefault("rateLimitRequests", defaultRateLimitRequests)
 	viper.SetDefault("rateLimitPeriodSec", defaultRateLimitPeriodSec)
-	viper.SetDefault("logLevel", defaultLogLevel)
-	viper.SetDefault("metricPriorities", defaultMetricPriorities)
-
 	viper.SetEnvPrefix("NVDLOOKUP")
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	viper.AutomaticEnv()
 	viper.BindEnv("nvdApiKey", "NVD_API_KEY")
-
 	configRead := false
 	if err := viper.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
-			logger.Info("Config file ('config.yaml') not found. Using defaults and environment variables.") // Changed to Info
+			log.Println("INFO: Config file ('config.yaml') not found.")
 		} else {
-			logger.Error("Error reading config file, proceeding with defaults/env vars", "path", viper.ConfigFileUsed(), "error", err)
+			log.Printf("WARN: Error reading config file (%s): %v", viper.ConfigFileUsed(), err)
 		}
 	} else {
 		configRead = true
 	}
-
 	if err := viper.Unmarshal(&cfg); err != nil {
-		logger.Error("FATAL: Unable to decode config into struct, check config file structure.", "error", err)
-		os.Exit(1) // Exit if config structure is wrong
+		log.Fatalf("FATAL: Unable to decode config: %v", err)
 	}
-
-	// Post-load validation/cleanup for numeric values
 	if cfg.MaxConcurrentFetches <= 0 {
 		cfg.MaxConcurrentFetches = defaultMaxConcurrentFetches
-		logger.Warn("Invalid maxConcurrentFetches, using default", "value", defaultMaxConcurrentFetches)
 	}
 	if cfg.RequestTimeoutSec <= 0 {
 		cfg.RequestTimeoutSec = defaultRequestTimeoutSec
-		logger.Warn("Invalid requestTimeoutSec, using default", "value", defaultRequestTimeoutSec)
 	}
 	if cfg.MaxRetries < 0 {
 		cfg.MaxRetries = defaultMaxRetries
-		logger.Warn("Invalid maxRetries, using default", "value", defaultMaxRetries)
 	}
 	if cfg.InitialBackoffSec <= 0 {
 		cfg.InitialBackoffSec = defaultInitialBackoffSec
-		logger.Warn("Invalid initialBackoffSec, using default", "value", defaultInitialBackoffSec)
 	}
 	if cfg.RateLimitRequests <= 0 {
 		cfg.RateLimitRequests = defaultRateLimitRequests
-		logger.Warn("Invalid rateLimitRequests, using default", "value", defaultRateLimitRequests)
 	}
 	if cfg.RateLimitPeriodSec <= 0 {
 		cfg.RateLimitPeriodSec = defaultRateLimitPeriodSec
-		logger.Warn("Invalid rateLimitPeriodSec, using default", "value", defaultRateLimitPeriodSec)
 	}
-
 	if configRead {
-		logger.Info("Configuration loaded successfully", "source_file", viper.ConfigFileUsed())
+		log.Printf("INFO: Config loaded from %s", viper.ConfigFileUsed())
 	} else {
-		logger.Info("Configuration initialized using defaults and environment variables.")
+		log.Println("INFO: Config initialized using defaults/env.")
 	}
-	logger.Debug("Effective Configuration", "config", cfg) // Log full config at debug
+	log.Printf("DEBUG: Effective Config: %+v", cfg)
 }
 
-// validateAndSortPriorities checks config and sorts priority list
-func validateAndSortPriorities() {
-	logger.Debug("Validating and sorting metric priorities from effective config...")
-	prioritiesFromConfig := cfg.MetricPriorities // Use loaded config struct
-	if len(prioritiesFromConfig) == 0 {
-		logger.Error("FATAL CONFIGURATION ERROR: metricPriorities map is empty in effective config.")
-		os.Exit(1) // Exit as priorities are fundamental
-	}
-
-	weightsSeen := make(map[int]string)
-	tempPriorities := make([]MetricPriorityConfig, 0, len(prioritiesFromConfig))
-
-	for version, weight := range prioritiesFromConfig {
-		if !strings.HasPrefix(version, "v") {
-			logger.Warn("Metric priority version might be invalid format", "version", version)
-		}
-		if existingVersion, found := weightsSeen[weight]; found {
-			logger.Error("FATAL CONFIGURATION ERROR: Duplicate metric priority weight found", "weight", weight, "version1", existingVersion, "version2", version)
-			os.Exit(1) // Exit on duplicate weights
-		}
-		weightsSeen[weight] = version
-		tempPriorities = append(tempPriorities, MetricPriorityConfig{Version: version, Weight: weight})
-	}
-
-	sort.Slice(tempPriorities, func(i, j int) bool { return tempPriorities[i].Weight > tempPriorities[j].Weight })
-	sortedPriorities = tempPriorities
-	logger.Info("Metric priority order validated and set", "priorities", sortedPriorities)
-}
-
+// --- HTTP Client Setup (Unchanged) ---
 func setupHTTPClient() {
-	httpClient = &http.Client{
-		Timeout: time.Duration(cfg.RequestTimeoutSec) * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: cfg.MaxConcurrentFetches * 2, // Allow more idle conns than workers
-			IdleConnTimeout:     90 * time.Second,
-			TLSHandshakeTimeout: 10 * time.Second,
-		},
-	}
-	logger.Debug("HTTP client initialized", "timeout_seconds", cfg.RequestTimeoutSec)
+	httpClient = &http.Client{Timeout: time.Duration(cfg.RequestTimeoutSec) * time.Second, Transport: &http.Transport{MaxIdleConns: 100, MaxIdleConnsPerHost: cfg.MaxConcurrentFetches * 2, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 10 * time.Second}}
+	log.Printf("DEBUG: HTTP client initialized (Timeout: %ds)", cfg.RequestTimeoutSec)
 }
 
+// --- User Agent Setup (Unchanged) ---
 func setUserAgent() {
-	userAgent = fmt.Sprintf("%s/%s (opensecurity)", appName, appVersion)
-	logger.Debug("User agent set", "user_agent", userAgent)
+	userAgent = fmt.Sprintf("%s/%s (contact: your-email@example.com)", appName, appVersion)
+	log.Printf("DEBUG: User agent set: %s", userAgent)
 }
 
-func validateCVEInput(rawIDs []string) []string {
-
-	// --- Validate, Normalize (Lowercase), and Deduplicate ---
+func getAndValidateCVEInput(rawIDs []string) []string {
 	validatedIDs := make([]string, 0, len(rawIDs))
 	seenIDs := make(map[string]bool)
-	invalidCount, duplicateCount, emptyCount := 0, 0, 0
-
+	invalidCount, duplicateCount := 0, 0
 	for _, idRaw := range rawIDs {
 		idLower := strings.ToLower(strings.TrimSpace(idRaw))
 		if idLower == "" {
-			emptyCount++
 			continue
 		}
 		if !cveRegex.MatchString(idLower) {
-			logger.Warn("Invalid CVE ID format provided, skipping.", "cve_id_raw", idRaw)
+			log.Printf("WARN: Invalid CVE ID format skipped: %q", idRaw)
 			invalidCount++
 			continue
 		}
@@ -506,429 +434,18 @@ func validateCVEInput(rawIDs []string) []string {
 		validatedIDs = append(validatedIDs, idLower)
 		seenIDs[idLower] = true
 	}
-
-	if emptyCount > 0 {
-		logger.Warn("Skipped empty input lines/args", "count", emptyCount)
-	}
 	if invalidCount > 0 {
-		logger.Warn("Skipped invalid CVE ID formats", "count", invalidCount)
+		log.Printf("WARN: Skipped %d invalid CVE IDs", invalidCount)
 	}
 	if duplicateCount > 0 {
-		logger.Info("Ignored duplicate CVE IDs", "count", duplicateCount)
+		log.Printf("INFO: Ignored %d duplicate CVE IDs", duplicateCount)
 	}
-
 	if len(validatedIDs) == 0 {
-		logger.Error("FATAL: No valid, unique CVE IDs found after processing input.")
-		os.Exit(1)
+		log.Fatal("FATAL: No valid, unique CVE IDs found.")
 	}
 	return validatedIDs
 }
 
-// printUsageAndExit prints help message and exits
-func printUsageAndExit() {
-	fmt.Fprintf(os.Stderr, "\nUsage:\n")
-	fmt.Fprintf(os.Stderr, "  %s <CVE-ID-1> ... [CVE-ID-%d]  (Max %d IDs via CLI)\n", os.Args[0], maxCLIInputCVEs, maxCLIInputCVEs)
-	fmt.Fprintf(os.Stderr, "  %s <path/to/cves.json>       (Max %d IDs via JSON file)\n", os.Args[0], maxJSONInputCVEs)
-	fmt.Fprintf(os.Stderr, "  %s -                         (Read JSON array from stdin, max %d IDs)\n", os.Args[0], maxJSONInputCVEs)
-	fmt.Fprintf(os.Stderr, "  cat cves.txt | %s             (Read CVEs one per line from stdin, max %d IDs)\n", os.Args[0], maxJSONInputCVEs)
-	fmt.Fprintf(os.Stderr, "\nJSON file/stdin should contain an array of CVE ID strings.\n")
-	fmt.Fprintf(os.Stderr, "Requires NVD_API_KEY env var (or nvdApiKey in config.yaml).\n")
-	fmt.Fprintf(os.Stderr, "See config.yaml for settings (outputMode, logging, rate limits etc.).\n")
-	os.Exit(1)
-}
-
-// processResults handles results based on configured outputMode
-func processResults(ctx context.Context, esClient opengovernance.Client, request tasks.TaskRequest, results <-chan CVEProcessingResult) int {
-	errorCount := 0
-	successfulCount := 0
-
-	for {
-		select {
-		case result, ok := <-results:
-			if !ok {
-				logger.Info("Result processing finished.")
-				return errorCount
-			}
-
-			// Process one result
-			log := logger.With("cve_id", result.CVEID) // Add CVE ID for context
-			if result.Error != nil {
-				log.Error("Failed processing CVE", "error", result.Error)
-				errorCount++
-			} else if result.Output != nil {
-				successfulCount++
-				log.Debug("Successfully processed CVE")
-				err := sendCveDetails(esClient, request, result.Output)
-				if err != nil {
-					log.Error("Failed to send CVE details to OSS Index", "error", err)
-					errorCount++
-				}
-			} else {
-				log.Warn("Received nil data and nil error from worker")
-			}
-
-		case <-ctx.Done():
-			logger.Warn("Context cancelled while processing results. Output may be incomplete.", "error", ctx.Err())
-			return errorCount + 1 // Indicate error due to cancellation
-		}
-	}
-}
-
-// --- Worker Goroutine ---
-
-func worker(ctx context.Context, log *slog.Logger, id int, jobs <-chan string, results chan<- CVEProcessingResult, wg *sync.WaitGroup, apiKey string, limiter *rate.Limiter) {
-	defer wg.Done()
-	log.Debug("Worker started")
-	for {
-		select {
-		case cveID, ok := <-jobs:
-			if !ok {
-				log.Debug("Worker finished: jobs channel closed")
-				return
-			}
-			log := log.With("cve_id", cveID) // Add CVE ID to worker's logger context
-			log.Debug("Worker processing job")
-			outputCVE, err := fetchAndProcessCVE(ctx, log, cveID, apiKey, limiter) // Pass context and logger
-
-			// Send result back, checking for context cancellation first
-			select {
-			case results <- CVEProcessingResult{CVEID: cveID, Output: outputCVE, Error: err}:
-				// Result sent
-			case <-ctx.Done():
-				log.Warn("Context cancelled while sending result", "error", ctx.Err())
-				return // Stop worker
-			}
-
-		case <-ctx.Done():
-			log.Warn("Worker shutting down due to context cancellation", "error", ctx.Err())
-			return
-		}
-	}
-}
-
-// --- Core Logic Functions ---
-
-// fetchAndProcessCVE coordinates fetching, parsing, and transforming for one CVE
-func fetchAndProcessCVE(ctx context.Context, log *slog.Logger, cveIDLower string, apiKey string, limiter *rate.Limiter) (*OutputCVE, error) {
-	// 1. Adhere to rate limit, respecting context cancellation
-	waitCtx, cancelWait := context.WithTimeout(ctx, time.Duration(cfg.RequestTimeoutSec+15)*time.Second) // Generous wait timeout
-	defer cancelWait()
-	log.Debug("Waiting for rate limiter...")
-	if err := limiter.Wait(waitCtx); err != nil {
-		log.Error("Rate limiter wait failed", "error", err)
-		return nil, fmt.Errorf("rate limiter error: %w", err) // Propagate context error if applicable
-	}
-	log.Debug("Rate limit permission granted.")
-
-	// Check context *after* potentially long wait but *before* network call
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	// 2. Fetch NVD data (use uppercase for API call), passing context and logger
-	cveIDForAPI := strings.ToUpper(cveIDLower)
-	bodyBytes, err := fetchNVDDataWithRetry(ctx, log, cveIDForAPI, apiKey)
-	if err != nil {
-		return nil, err
-	} // Error already includes context
-
-	// Check context again after fetch
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	// 3. Unmarshal JSON response
-	var inputData InputNVDResponse
-	log.Debug("Unmarshalling NVD response")
-	if err := json.Unmarshal(bodyBytes, &inputData); err != nil {
-		log.Error("Failed to unmarshal NVD JSON", "error", err, "body_snippet", limitString(string(bodyBytes), 200))
-		return nil, fmt.Errorf("unmarshal error: %w", err)
-	}
-
-	// 4. Validate response structure and ID
-	if len(inputData.Vulnerabilities) == 0 {
-		log.Warn("CVE not found in NVD response")
-		return nil, fmt.Errorf("CVE %s not found in NVD response", cveIDForAPI)
-	}
-	inputVuln := inputData.Vulnerabilities[0]
-	if len(inputData.Vulnerabilities) > 1 {
-		log.Warn("API returned multiple vulnerabilities for single CVE request. Processing first.", "count", len(inputData.Vulnerabilities))
-	}
-	if returnedIDLower := strings.ToLower(inputVuln.CVE.ID); returnedIDLower != cveIDLower {
-		log.Warn("API returned different CVE ID than requested.", "requested_lower", cveIDLower, "returned_actual", inputVuln.CVE.ID)
-		// Decide if this is an error or just a warning. For now, proceed.
-	}
-
-	// 5. Transform data into desired output format
-	log.Debug("Transforming vulnerability data")
-	outputCVE := transformSingleVulnerability(log, inputVuln) // Pass logger
-	log.Debug("Transformation complete")
-	return &outputCVE, nil
-}
-
-// fetchNVDDataWithRetry handles HTTP GET request with backoff, respecting context
-func fetchNVDDataWithRetry(ctx context.Context, log *slog.Logger, cveIDForAPI, apiKey string) ([]byte, error) {
-	apiURL := fmt.Sprintf("%s?cveId=%s", nvdBaseURL, cveIDForAPI)
-	var lastErr error
-
-	for attempt := 0; attempt <= cfg.MaxRetries; attempt++ {
-		// Check context before attempting/retrying
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-
-		if attempt > 0 {
-			backoffDuration := time.Duration(cfg.InitialBackoffSec) * time.Second * time.Duration(math.Pow(2, float64(attempt-1)))
-			log.Warn("Retrying request after error", "attempt", attempt, "max_retries", cfg.MaxRetries, "wait_duration", backoffDuration, "last_error", lastErr)
-			// Sleep respecting context cancellation
-			select {
-			case <-time.After(backoffDuration): // Wait for backoff duration
-			case <-ctx.Done(): // If context cancelled during sleep
-				log.Warn("Context cancelled during backoff sleep", "error", ctx.Err())
-				return nil, ctx.Err()
-			}
-		}
-
-		// Create request with context for this attempt
-		req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
-		if err != nil {
-			return nil, fmt.Errorf("create request error (attempt %d): %w", attempt, err)
-		} // Should be rare
-
-		req.Header.Add("apiKey", apiKey)
-		req.Header.Add("User-Agent", userAgent)
-
-		log.Info("Requesting NVD API", "attempt", attempt+1)
-		resp, err := httpClient.Do(req) // Use shared client
-
-		// --- Handle Network/Transport/Context Errors ---
-		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				log.Warn("Context cancelled/timed out during HTTP request", "error", err)
-				return nil, err // Propagate context error
-			}
-			lastErr = fmt.Errorf("request execution error (attempt %d): %w", attempt, err)
-			log.Warn("HTTP request execution failed, will retry if possible", "error", err)
-			continue // Retry on potentially transient network errors
-		}
-
-		// --- Handle HTTP Response ---
-		bodyBytes, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if readErr != nil {
-			lastErr = fmt.Errorf("read body error (attempt %d, status %d): %w", attempt, resp.StatusCode, readErr)
-			log.Warn("Failed to read response body, will retry if possible", "status", resp.StatusCode, "error", readErr)
-			continue // Retry on read errors
-		}
-
-		// --- Handle HTTP Status Codes ---
-		statusCode := resp.StatusCode
-		log := log.With(slog.Int("status_code", statusCode)) // Add status code to context
-		switch {
-		case statusCode == http.StatusOK:
-			log.Info("Successfully fetched data from NVD")
-			return bodyBytes, nil // Success!
-
-		case statusCode == http.StatusTooManyRequests || statusCode == http.StatusForbidden: // 429 or 403
-			lastErr = fmt.Errorf("retryable NVD API error (%d)", statusCode)
-			log.Warn("NVD API returned retryable status, will backoff and retry", "error", lastErr)
-			// Continue loop for backoff/retry
-
-		case statusCode >= 500: // 5xx Server Errors
-			lastErr = fmt.Errorf("NVD server error (%d)", statusCode)
-			log.Warn("NVD API returned server error, will backoff and retry", "error", lastErr)
-			// Continue loop for backoff/retry
-
-		default: // Other 4xx Client Errors (e.g., 404 Not Found, 400 Bad Request)
-			lastErr = fmt.Errorf("non-retryable NVD client error (%d)", statusCode)
-			if len(bodyBytes) > 0 {
-				lastErr = fmt.Errorf("%w - Body: %s", lastErr, limitString(string(bodyBytes), 200))
-			}
-			log.Error("Received non-retryable client error from NVD", "error", lastErr)
-			// Do NOT retry other client errors - return the error immediately
-			return nil, lastErr
-		}
-		// Loop continues for retryable errors
-	}
-
-	// If the loop finishes, all retries have been exhausted
-	log.Error("Request failed after maximum retries", "max_retries", cfg.MaxRetries, "last_error", lastErr)
-	return nil, fmt.Errorf("retries exceeded after %d attempts: %w", cfg.MaxRetries, lastErr)
-}
-
-// transformSingleVulnerability applies filtering and prioritization rules
-func transformSingleVulnerability(log *slog.Logger, vuln InputVulnerability) OutputCVE {
-	log.Debug("Starting transformation")
-	outputCVE := OutputCVE{
-		CveID:                 vuln.CVE.ID,
-		SourceIdentifier:      vuln.CVE.SourceIdentifier,
-		Published:             vuln.CVE.Published,
-		LastModified:          vuln.CVE.LastModified,
-		VulnStatus:            vuln.CVE.VulnStatus,
-		Descriptions:          make([]OutputDescription, 0, 1),
-		Metrics:               OutputMetrics{}, // Initialize empty
-		Weaknesses:            make([]OutputWeakness, 0, len(vuln.CVE.Weaknesses)),
-		CisaExploitAdd:        vuln.CVE.CisaExploitAdd,
-		CisaActionDue:         vuln.CVE.CisaActionDue,
-		CisaRequiredAction:    vuln.CVE.CisaRequiredAction,
-		CisaVulnerabilityName: vuln.CVE.CisaVulnerabilityName,
-	}
-
-	// Filter descriptions for English ('en')
-	foundDesc := false
-	for _, desc := range vuln.CVE.Descriptions {
-		if desc.Lang == "en" {
-			outputCVE.Descriptions = append(outputCVE.Descriptions, OutputDescription{Lang: desc.Lang, Value: desc.Value})
-			foundDesc = true
-			break
-		}
-	}
-	if !foundDesc {
-		log.Debug("No English description found")
-	}
-
-	// Apply Metrics Priority and populate normalized fields
-	foundMetrics := false
-	for _, priorityConfig := range sortedPriorities { // Use sorted global priorities
-		version := priorityConfig.Version
-		metricsPopulated := false
-
-		switch version {
-		case "v4.0":
-			if len(vuln.CVE.Metrics.CvssMetricV40) > 0 {
-				outputCVE.Metrics.CvssMetricV40 = vuln.CVE.Metrics.CvssMetricV40
-				metricsPopulated = true
-			}
-		case "v3.1":
-			if !foundMetrics && len(vuln.CVE.Metrics.CvssMetricV31) > 0 {
-				outputCVE.Metrics.CvssMetricV31 = vuln.CVE.Metrics.CvssMetricV31
-				metricsPopulated = true
-			}
-		case "v2.0":
-			if !foundMetrics && len(vuln.CVE.Metrics.CvssMetricV2) > 0 {
-				outputCVE.Metrics.CvssMetricV2 = vuln.CVE.Metrics.CvssMetricV2
-				metricsPopulated = true
-			}
-		}
-
-		if metricsPopulated {
-			foundMetrics = true
-			// Populate normalized fields based on the version found
-			populateNormalizedCVSS(log, &outputCVE, version, &vuln.CVE.Metrics) // Pass logger
-			log.Debug("Applied highest priority metrics", "version", version)
-			break // Strict priority
-		}
-	}
-	if !foundMetrics {
-		log.Debug("No prioritized metrics found")
-	}
-
-	// Filter weaknesses descriptions for English ('en')
-	for _, weak := range vuln.CVE.Weaknesses {
-		filteredWeaknessDesc := make([]OutputDescription, 0)
-		for _, desc := range weak.Description {
-			if desc.Lang == "en" {
-				filteredWeaknessDesc = append(filteredWeaknessDesc, OutputDescription{Lang: desc.Lang, Value: desc.Value})
-			}
-		}
-		if len(filteredWeaknessDesc) > 0 {
-			outputCVE.Weaknesses = append(outputCVE.Weaknesses, OutputWeakness{
-				Source: weak.Source, Type: weak.Type, Description: filteredWeaknessDesc,
-			})
-		} else {
-			log.Debug("Weakness source skipped due to no English description", "source", weak.Source)
-		}
-	}
-
-	log.Debug("Transformation finished")
-	return outputCVE
-}
-
-// populateNormalizedCVSS fills the top-level CVSS fields based on the prioritized metric data found
-// It modifies the outputCVE struct directly via the pointer.
-func populateNormalizedCVSS(log *slog.Logger, outputCVE *OutputCVE, version string, metrics *InputMetrics) {
-	outputCVE.CvssVersion = version // Always set the version that was chosen
-
-	// Use data from the first metric entry of the chosen version for normalization
-	log = log.With("cvss_version_chosen", version) // Add chosen version to logger context
-	switch version {
-	case "v4.0":
-		if len(metrics.CvssMetricV40) > 0 {
-			// Use first available metric for normalized fields
-			m := metrics.CvssMetricV40[0].CvssData // Get V4 data
-			log.Debug("Populating normalized fields from CVSS v4.0")
-			outputCVE.CvssScore = m.BaseScore
-			outputCVE.CvssSeverity = m.BaseSeverity
-			outputCVE.CvssAttackVector = m.AttackVector
-			outputCVE.CvssAttackComplexity = m.AttackComplexity
-			outputCVE.CvssPrivilegesRequired = m.PrivilegesRequired
-			outputCVE.CvssUserInteraction = m.UserInteraction
-			outputCVE.CvssConfImpact = m.VulnConfidentialityImpact // Use Vuln... fields for v4 base impact
-			outputCVE.CvssIntegImpact = m.VulnIntegrityImpact
-			outputCVE.CvssAvailImpact = m.VulnAvailabilityImpact
-		} else {
-			// This should ideally not happen if called correctly after checking len > 0, but log defensively
-			log.Warn("Attempted to populate normalized fields from v4.0, but metric list was empty")
-		}
-	case "v3.1":
-		if len(metrics.CvssMetricV31) > 0 {
-			m := metrics.CvssMetricV31[0].CvssData // Get V3.1 data
-			log.Debug("Populating normalized fields from CVSS v3.1")
-			outputCVE.CvssScore = m.BaseScore
-			outputCVE.CvssSeverity = m.BaseSeverity
-			outputCVE.CvssAttackVector = m.AttackVector
-			outputCVE.CvssAttackComplexity = m.AttackComplexity
-			outputCVE.CvssPrivilegesRequired = m.PrivilegesRequired
-			outputCVE.CvssUserInteraction = m.UserInteraction
-			outputCVE.CvssConfImpact = m.ConfidentialityImpact
-			outputCVE.CvssIntegImpact = m.IntegrityImpact
-			outputCVE.CvssAvailImpact = m.AvailabilityImpact
-		} else {
-			log.Warn("Attempted to populate normalized fields from v3.1, but metric list was empty")
-		}
-	case "v2.0":
-		if len(metrics.CvssMetricV2) > 0 {
-			m := metrics.CvssMetricV2[0] // Get V2 metric struct
-			mData := m.CvssData          // Get V2 data struct
-			log.Debug("Populating normalized fields from CVSS v2.0")
-			outputCVE.CvssScore = mData.BaseScore
-			outputCVE.CvssSeverity = m.BaseSeverity                 // Severity is on metric struct for v2
-			outputCVE.CvssAttackVector = mData.AccessVector         // Map v2 name
-			outputCVE.CvssAttackComplexity = mData.AccessComplexity // Map v2 name
-			// Map v2 Authentication -> Privileges Required
-			switch mData.Authentication {
-			case "NONE":
-				outputCVE.CvssPrivilegesRequired = "NONE"
-			case "SINGLE_INSTANCE", "SINGLE":
-				outputCVE.CvssPrivilegesRequired = "LOW"
-			case "MULTIPLE_INSTANCES", "MULTIPLE":
-				outputCVE.CvssPrivilegesRequired = "HIGH"
-			default:
-				outputCVE.CvssPrivilegesRequired = strings.ToUpper(mData.Authentication) // Fallback or UNKNOWN?
-				log.Warn("Unknown CVSSv2 Authentication mapping", "v2_auth", mData.Authentication)
-			}
-			// Map v2 User Interaction Required -> User Interaction
-			if m.UserInteractionRequired {
-				outputCVE.CvssUserInteraction = "REQUIRED"
-			} else {
-				outputCVE.CvssUserInteraction = "NONE"
-			}
-			// Map v2 Impact -> v3/v4 Impact levels (using a map for clarity)
-			impactMap := map[string]string{"NONE": "NONE", "PARTIAL": "LOW", "COMPLETE": "HIGH"}
-			outputCVE.CvssConfImpact = impactMap[mData.ConfidentialityImpact]
-			outputCVE.CvssIntegImpact = impactMap[mData.IntegrityImpact]
-			outputCVE.CvssAvailImpact = impactMap[mData.AvailabilityImpact]
-		} else {
-			log.Warn("Attempted to populate normalized fields from v2.0, but metric list was empty")
-		}
-	default:
-		// Should not happen if called correctly based on sortedPriorities check
-		log.Warn("Unknown CVSS version encountered in populateNormalizedCVSS", "version", version)
-	}
-	// No return value needed as outputCVE is modified via pointer
-}
-
-// limitString truncates a string for cleaner logging
 func limitString(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
@@ -938,6 +455,339 @@ func limitString(s string, maxLen int) string {
 		return s
 	}
 	return string(runes[:maxLen]) + "..."
+}
+
+// --- Result Processing (MODIFIED LOGGING) ---
+func processResults(ctx context.Context, results <-chan CVEProcessingResult) []CVEProcessingResult {
+	processedResults := make([]CVEProcessingResult, 0)
+	log.Println("INFO: Waiting to process results...")
+	for {
+		select {
+		case result, ok := <-results:
+			if !ok {
+				log.Println("INFO: Result processing finished.")
+				sort.Slice(processedResults, func(i, j int) bool { return processedResults[i].InputCVEID < processedResults[j].InputCVEID })
+				return processedResults
+			}
+			if result.Error != nil {
+				// MODIFIED: Use uppercase ID in error log
+				log.Printf("ERROR: Failed processing CVE %s: %v", strings.ToUpper(result.InputCVEID), result.Error)
+			}
+			processedResults = append(processedResults, result)
+		case <-ctx.Done():
+			log.Printf("WARN: Context cancelled while processing results. Output may be incomplete: %v", ctx.Err())
+			sort.Slice(processedResults, func(i, j int) bool { return processedResults[i].InputCVEID < processedResults[j].InputCVEID })
+			return processedResults
+		}
+	}
+}
+
+// --- Final Output (Unchanged) ---
+func outputFinalJSONArray(esClient opengovernance.Client, request tasks.TaskRequest, results []CVEProcessingResult) {
+	for _, res := range results {
+		if res.Error != nil {
+			log.Printf("WARN: Failed to send result for %s: %v", res.InputCVEID, res.Error)
+			continue
+		}
+		if res.Output != nil {
+			err := sendCveDetails(esClient, request, res.Output)
+			if err != nil {
+				log.Printf("ERROR: Failed to send result for %s: %v", res.InputCVEID, err)
+			}
+		}
+	}
+}
+
+// --- Worker and Fetching Logic (MODIFIED LOGGING) ---
+func worker(ctx context.Context, id int, jobs <-chan string, results chan<- CVEProcessingResult, wg *sync.WaitGroup, apiKey string, limiter *rate.Limiter) {
+	defer wg.Done()
+	log.Printf("DEBUG: Worker %d started", id)
+	for {
+		select {
+		case cveIDLower, ok := <-jobs:
+			if !ok {
+				log.Printf("DEBUG: Worker %d finished: jobs channel closed", id)
+				return
+			}
+			// MODIFIED: Create uppercase version for logging *within worker*
+			cveIDUpper := strings.ToUpper(cveIDLower)
+			log.Printf("DEBUG: Worker %d processing job: %s", id, cveIDUpper)
+			outputCVE, err := fetchAndTransformCVE(ctx, cveIDLower, apiKey, limiter) // Pass lowercase for internal use, uppercase used inside fetchAndTransformCVE for its logging
+			select {
+			case results <- CVEProcessingResult{InputCVEID: cveIDLower, Output: outputCVE, Error: err}:
+			case <-ctx.Done():
+				log.Printf("WARN: Worker %d: Context cancelled sending result for %s: %v", id, cveIDUpper, ctx.Err())
+				return // Log with uppercase
+			}
+		case <-ctx.Done():
+			log.Printf("WARN: Worker %d shutting down due to context cancellation: %v", id, ctx.Err())
+			return
+		}
+	}
+}
+
+func fetchAndTransformCVE(ctx context.Context, cveIDLower string, apiKey string, limiter *rate.Limiter) (*TargetCve, error) {
+	// MODIFIED: Create uppercase version early for consistent logging prefix
+	cveIDUpper := strings.ToUpper(cveIDLower)
+	waitCtx, cancelWait := context.WithTimeout(ctx, time.Duration(cfg.RequestTimeoutSec+15)*time.Second)
+	defer cancelWait()
+	log.Printf("DEBUG: [%s] Waiting for rate limiter...", cveIDUpper) // Use Upper
+	if err := limiter.Wait(waitCtx); err != nil {
+		log.Printf("ERROR: [%s] Rate limiter wait failed: %v", cveIDUpper, err) // Use Upper
+		return nil, fmt.Errorf("[%s] rate limiter error: %w", cveIDUpper, err)  // Use Upper in error
+	}
+	log.Printf("DEBUG: [%s] Rate limit permission granted.", cveIDUpper) // Use Upper
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// Pass uppercase ID as BOTH logPrefix and cveIDForAPI to fetchNVDDataWithRetry
+	bodyBytes, err := fetchNVDDataWithRetry(ctx, cveIDUpper, cveIDUpper, apiKey)
+	if err != nil {
+		return nil, err
+	} // Errors from fetch already include the uppercase prefix
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	var inputData InputNVDResponse
+	log.Printf("DEBUG: [%s] Unmarshalling NVD response", cveIDUpper) // Use Upper
+	if err := json.Unmarshal(bodyBytes, &inputData); err != nil {
+		log.Printf("ERROR: [%s] Failed to unmarshal NVD JSON: %v", cveIDUpper, err) // Use Upper
+		return nil, fmt.Errorf("[%s] unmarshal error: %w", cveIDUpper, err)         // Use Upper in error
+	}
+
+	if len(inputData.Vulnerabilities) == 0 {
+		log.Printf("WARN: [%s] CVE not found in NVD response", cveIDUpper)   // Use Upper
+		return nil, fmt.Errorf("[%s] not found in NVD response", cveIDUpper) // Use Upper in error
+	}
+	inputVuln := inputData.Vulnerabilities[0]
+	if len(inputData.Vulnerabilities) > 1 {
+		log.Printf("WARN: [%s] API returned multiple vulnerabilities (%d). Processing only first.", cveIDUpper, len(inputData.Vulnerabilities)) // Use Upper
+	}
+	// Check using uppercase comparison now
+	if returnedIDUpper := strings.ToUpper(inputVuln.CVE.ID); returnedIDUpper != cveIDUpper {
+		log.Printf("WARN: [%s] API returned different CVE ID (%s) than requested.", cveIDUpper, inputVuln.CVE.ID) // Use Upper
+	}
+
+	log.Printf("DEBUG: [%s] Transforming vulnerability data", cveIDUpper) // Use Upper
+	outputCVE := transformCve(inputVuln.CVE)                              // Pass inner CVE
+	log.Printf("DEBUG: [%s] Transformation complete", cveIDUpper)         // Use Upper
+	return &outputCVE, nil
+}
+
+// fetchNVDDataWithRetry performs the HTTP GET with retries, enhanced timeout confirmation, and uppercase logging.
+func fetchNVDDataWithRetry(ctx context.Context, logPrefix, cveIDForAPI, apiKey string) ([]byte, error) {
+	// logPrefix is now expected to be the UPPERCASE CVE ID
+	// cveIDForAPI is also UPPERCASE
+	apiURL := fmt.Sprintf("%s?cveId=%s", nvdBaseURL, cveIDForAPI)
+	var lastErr error
+	configuredTimeout := time.Duration(cfg.RequestTimeoutSec) * time.Second
+
+	for attempt := 0; attempt <= cfg.MaxRetries; attempt++ {
+		// Check parent context before starting attempt or sleep
+		if err := ctx.Err(); err != nil {
+			log.Printf("WARN: [%s] Parent context cancelled before attempt %d: %v", logPrefix, attempt+1, err) // Use attempt+1 for user-facing log
+			return nil, err
+		}
+
+		if attempt > 0 {
+			backoffDuration := time.Duration(cfg.InitialBackoffSec) * time.Second * time.Duration(math.Pow(2, float64(attempt-1)))
+			log.Printf("WARN: [%s] Retrying request (attempt %d/%d) after error: %v. Waiting %v", logPrefix, attempt+1, cfg.MaxRetries+1, lastErr, backoffDuration)
+			select {
+			case <-time.After(backoffDuration):
+				// Continue
+			case <-ctx.Done():
+				log.Printf("WARN: [%s] Parent context cancelled during backoff sleep: %v", logPrefix, ctx.Err())
+				return nil, ctx.Err()
+			}
+		}
+
+		// Create request context WITH THE TIMEOUT for this specific attempt
+		reqCtx, cancelReq := context.WithTimeout(ctx, configuredTimeout)
+		// *** We defer cancelReq immediately after creating reqCtx ***
+		// This ensures it's called even if NewRequestWithContext fails (unlikely)
+		// or if errors occur before httpClient.Do
+		defer cancelReq()
+
+		req, err := http.NewRequestWithContext(reqCtx, "GET", apiURL, nil)
+		if err != nil {
+			// No need to call cancelReq here, defer handles it.
+			return nil, fmt.Errorf("[%s] create request error (attempt %d): %w", logPrefix, attempt+1, err)
+		}
+
+		if apiKey != "" {
+			req.Header.Add("apiKey", apiKey)
+		}
+		req.Header.Add("User-Agent", userAgent)
+
+		log.Printf("INFO: [%s] Requesting NVD API (attempt %d/%d, timeout: %v)", logPrefix, attempt+1, cfg.MaxRetries+1, configuredTimeout)
+		resp, err := httpClient.Do(req) // Execute request with reqCtx
+
+		// --- Analyze httpClient.Do errors ---
+		if err != nil {
+			// Check if the specific error is context.DeadlineExceeded from reqCtx
+			if errors.Is(err, context.DeadlineExceeded) {
+				// CONFIRMATION: Timeout occurred during connection/headers phase
+				timeoutErr := fmt.Errorf("[%s] request timeout (%v) exceeded during HTTP Do (attempt %d): %w", logPrefix, configuredTimeout, attempt+1, err)
+				log.Printf("WARN: %v", timeoutErr)
+				lastErr = timeoutErr
+				// continue // Retry on timeout
+			} else if errors.Is(err, context.Canceled) {
+				// Could be reqCtx cancelled by parent ctx, or other cancellation
+				// Check if parent context (ctx) caused the cancellation
+				if ctx.Err() != nil {
+					log.Printf("WARN: [%s] Parent context cancelled during HTTP Do (attempt %d): %v", logPrefix, attempt+1, ctx.Err())
+					return nil, ctx.Err() // Exit if parent is done
+				}
+				// Otherwise, likely specific reqCtx cancellation not due to its deadline
+				lastErr = fmt.Errorf("[%s] request cancelled during HTTP Do (attempt %d): %w", logPrefix, attempt+1, err)
+				log.Printf("WARN: %v", lastErr)
+				// continue // Assume retryable if parent not cancelled?
+			} else {
+				// Other network/client errors (DNS, connection refused etc.)
+				lastErr = fmt.Errorf("[%s] request execution error (attempt %d): %w", logPrefix, attempt+1, err)
+				log.Printf("WARN: [%s] HTTP request failed (attempt %d), will retry: %v", logPrefix, attempt+1, err)
+				// continue // Retry generic client errors
+			}
+			// No need to call cancelReq, defer handles it.
+			continue // Go to next retry attempt
+		}
+
+		// If we got a response, ensure the body will be closed
+		bodyCloseFunc := resp.Body.Close
+		defer func() { _ = bodyCloseFunc() }() // Use defer closer
+
+		statusCode := resp.StatusCode
+		log.Printf("DEBUG: [%s] Received NVD response (attempt %d, status: %d)", logPrefix, attempt+1, statusCode)
+
+		// --- Handle Status Codes ---
+		switch {
+		case statusCode == http.StatusOK:
+			// Success status, proceed to read body below
+		case statusCode == http.StatusNotFound:
+			lastErr = fmt.Errorf("[%s] CVE not found at NVD (status %d)", logPrefix, statusCode)
+			log.Printf("WARN: [%s] %v", logPrefix, lastErr)
+			return nil, lastErr // Don't retry 404
+		case statusCode == http.StatusTooManyRequests || statusCode == http.StatusForbidden:
+			lastErr = fmt.Errorf("[%s] retryable NVD API error (status %d)", logPrefix, statusCode)
+			log.Printf("WARN: [%s] NVD API returned retryable status %d, will backoff and retry", logPrefix, statusCode)
+			continue // Retry
+		case statusCode >= 500:
+			lastErr = fmt.Errorf("[%s] NVD server error (status %d)", logPrefix, statusCode)
+			log.Printf("WARN: [%s] NVD API returned server error %d, will backoff and retry", logPrefix, statusCode)
+			continue // Retry
+		default: // Other 4xx
+			bodyBytes, _ := io.ReadAll(resp.Body)       // Read for error context
+			_ = resp.Body.Close()                       // Close immediately after read
+			bodyCloseFunc = func() error { return nil } // Prevent double close in defer
+			lastErr = fmt.Errorf("[%s] non-retryable NVD client error (status %d)", logPrefix, statusCode)
+			if len(bodyBytes) > 0 {
+				lastErr = fmt.Errorf("%w - Body: %s", lastErr, limitString(string(bodyBytes), 200))
+			}
+			log.Printf("ERROR: [%s] Received non-retryable client error %d from NVD: %v", logPrefix, statusCode, lastErr)
+			return nil, lastErr // Don't retry
+		}
+
+		// --- Read Body (only if status was OK) ---
+		log.Printf("DEBUG: [%s] Reading response body (status %d)...", logPrefix, statusCode)
+		bodyBytes, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()                       // Close body immediately after read attempt
+		bodyCloseFunc = func() error { return nil } // Prevent double close in defer
+
+		if readErr != nil {
+			// --- Analyze body reading errors ---
+			// Check DeadlineExceeded FIRST
+			if errors.Is(readErr, context.DeadlineExceeded) {
+				// *** CONFIRMATION LOG ***
+				timeoutErr := fmt.Errorf("[%s] read body timeout (%v) exceeded (attempt %d, status %d): %w", logPrefix, configuredTimeout, attempt+1, statusCode, readErr)
+				log.Printf("WARN: %v", timeoutErr)
+				lastErr = timeoutErr
+				// continue // Retry timeout during body read
+			} else if errors.Is(readErr, context.Canceled) {
+				// Check if parent context caused cancellation
+				if ctx.Err() != nil {
+					log.Printf("WARN: [%s] Parent context cancelled during body read (attempt %d, status %d): %v", logPrefix, attempt+1, statusCode, ctx.Err())
+					return nil, ctx.Err() // Exit if parent is done
+				}
+				// Otherwise, reqCtx likely cancelled, maybe retry
+				lastErr = fmt.Errorf("[%s] read body cancelled (attempt %d, status %d): %w", logPrefix, attempt+1, statusCode, readErr)
+				log.Printf("WARN: %v", lastErr)
+				// continue
+			} else {
+				// Other generic I/O error
+				lastErr = fmt.Errorf("[%s] read body error (attempt %d, status %d): %w", logPrefix, attempt+1, statusCode, readErr)
+				log.Printf("WARN: [%s] Failed to read response body (attempt %d), will retry: %v", logPrefix, attempt+1, readErr)
+				// continue
+			}
+			continue // Go to next retry attempt for any read error
+		}
+
+		// Success: status was 200 OK and body read succeeded
+		log.Printf("INFO: [%s] Successfully fetched and read data from NVD (attempt %d)", logPrefix, attempt+1)
+		return bodyBytes, nil // SUCCESS
+
+	} // End retry loop
+
+	// If loop finished without success
+	log.Printf("ERROR: [%s] Request failed after maximum retries (%d)", logPrefix, cfg.MaxRetries)
+	return nil, fmt.Errorf("[%s] retries exceeded after %d attempts: %w", logPrefix, cfg.MaxRetries, lastErr)
+}
+
+// --- Transformation Logic (Unchanged) ---
+func transformCve(sourceCve InputCVE) TargetCve {
+	target := TargetCve{
+		ID:                    strings.ToUpper(sourceCve.ID), // Ensure ID is uppercase
+		SourceIdentifier:      sourceCve.SourceIdentifier,
+		Published:             sourceCve.Published,
+		LastModified:          sourceCve.LastModified,
+		VulnStatus:            sourceCve.VulnStatus,
+		CisaExploitAdd:        sourceCve.CisaExploitAdd,
+		CisaActionDue:         sourceCve.CisaActionDue,
+		CisaRequiredAction:    sourceCve.CisaRequiredAction,
+		CisaVulnerabilityName: sourceCve.CisaVulnerabilityName,
+	}
+	for _, desc := range sourceCve.Descriptions {
+		if desc.Lang == "en" {
+			target.Description = desc.Value
+			break
+		}
+	}
+	if target.Description == "" && len(sourceCve.Descriptions) > 0 {
+		log.Printf("WARN: [%s] No English description found.", target.ID) // Log using uppercase target ID
+	}
+	var collectedMetrics []interface{}
+	if sourceCve.Metrics != nil {
+		collectedMetrics = make([]interface{}, 0)
+		if len(sourceCve.Metrics.CvssMetricV2) > 0 {
+			for _, srcV2 := range sourceCve.Metrics.CvssMetricV2 {
+				targetV2 := TargetCvssMetricV2{Source: srcV2.Source, Type: srcV2.Type, CvssData: TargetCvssDataV2{Version: srcV2.CvssData.Version, VectorString: srcV2.CvssData.VectorString, AccessVector: srcV2.CvssData.AccessVector, AccessComplexity: srcV2.CvssData.AccessComplexity, Authentication: srcV2.CvssData.Authentication, ConfidentialityImpact: srcV2.CvssData.ConfidentialityImpact, IntegrityImpact: srcV2.CvssData.IntegrityImpact, AvailabilityImpact: srcV2.CvssData.AvailabilityImpact, BaseScore: srcV2.CvssData.BaseScore, BaseSeverity: srcV2.BaseSeverity}, ExploitabilityScore: srcV2.ExploitabilityScore, ImpactScore: srcV2.ImpactScore, AcInsufInfo: srcV2.AcInsufInfo, ObtainAllPrivilege: srcV2.ObtainAllPrivilege, ObtainUserPrivilege: srcV2.ObtainUserPrivilege, ObtainOtherPrivilege: srcV2.ObtainOtherPrivilege, UserInteractionRequired: srcV2.UserInteractionRequired}
+				collectedMetrics = append(collectedMetrics, targetV2)
+			}
+		}
+		if len(sourceCve.Metrics.CvssMetricV31) > 0 {
+			for _, srcV31 := range sourceCve.Metrics.CvssMetricV31 {
+				targetV31 := TargetCvssMetricV31{Source: srcV31.Source, Type: srcV31.Type, CvssData: TargetCvssDataV31{Version: srcV31.CvssData.Version, VectorString: srcV31.CvssData.VectorString, AttackVector: srcV31.CvssData.AttackVector, AttackComplexity: srcV31.CvssData.AttackComplexity, PrivilegesRequired: srcV31.CvssData.PrivilegesRequired, UserInteraction: srcV31.CvssData.UserInteraction, Scope: srcV31.CvssData.Scope, ConfidentialityImpact: srcV31.CvssData.ConfidentialityImpact, IntegrityImpact: srcV31.CvssData.IntegrityImpact, AvailabilityImpact: srcV31.CvssData.AvailabilityImpact, BaseScore: srcV31.CvssData.BaseScore, BaseSeverity: srcV31.CvssData.BaseSeverity}, ExploitabilityScore: srcV31.ExploitabilityScore, ImpactScore: srcV31.ImpactScore}
+				collectedMetrics = append(collectedMetrics, targetV31)
+			}
+		}
+		if len(sourceCve.Metrics.CvssMetricV40) > 0 {
+			for _, srcV40 := range sourceCve.Metrics.CvssMetricV40 {
+				targetV40 := TargetCvssMetricV40{Source: srcV40.Source, Type: srcV40.Type, CvssData: TargetCvssDataV40{Version: srcV40.CvssData.Version, VectorString: srcV40.CvssData.VectorString, BaseScore: srcV40.CvssData.BaseScore, BaseSeverity: srcV40.CvssData.BaseSeverity, AttackVector: srcV40.CvssData.AttackVector, AttackComplexity: srcV40.CvssData.AttackComplexity, AttackRequirements: srcV40.CvssData.AttackRequirements, PrivilegesRequired: srcV40.CvssData.PrivilegesRequired, UserInteraction: srcV40.CvssData.UserInteraction, VulnConfidentialityImpact: srcV40.CvssData.VulnConfidentialityImpact, VulnIntegrityImpact: srcV40.CvssData.VulnIntegrityImpact, VulnAvailabilityImpact: srcV40.CvssData.VulnAvailabilityImpact, SubConfidentialityImpact: srcV40.CvssData.SubConfidentialityImpact, SubIntegrityImpact: srcV40.CvssData.SubIntegrityImpact, SubAvailabilityImpact: srcV40.CvssData.SubAvailabilityImpact}}
+				collectedMetrics = append(collectedMetrics, targetV40)
+			}
+		}
+	}
+	if len(collectedMetrics) > 0 {
+		target.Metrics = collectedMetrics
+	}
+	if len(sourceCve.Weaknesses) > 0 {
+		target.Weaknesses = make([]TargetWeakness, len(sourceCve.Weaknesses))
+		for i, srcWeakness := range sourceCve.Weaknesses {
+			target.Weaknesses[i] = TargetWeakness{Source: srcWeakness.Source, Type: srcWeakness.Type, Description: srcWeakness.Description}
+		}
+	}
+	return target
 }
 
 // GetVulnerabilitiesFromQueryID fetches SBOMs using a named query ID. Reads QueryLimit from params.
@@ -1042,14 +892,14 @@ func mapCoreQueryResultToCve(queryResponse *coreApi.RunQueryResponse) ([]string,
 	return ids, nil
 }
 
-func sendCveDetails(esClient og_es_sdk.Client, request tasks.TaskRequest, r *OutputCVE) (err error) {
+func sendCveDetails(esClient og_es_sdk.Client, request tasks.TaskRequest, r *TargetCve) (err error) {
 	if r == nil {
 		return nil
 	}
 	esResult := &es.TaskResult{
 		PlatformID:   fmt.Sprintf("%s:::%s:::%s", request.TaskDefinition.TaskType, request.TaskDefinition.ResultType, r.UniqueID()),
 		ResourceID:   r.UniqueID(),
-		ResourceName: r.CveID,
+		ResourceName: r.ID,
 		Description:  r, // Embed the full SbomVulnerabilities struct
 		ResultType:   strings.ToLower(request.TaskDefinition.ResultType),
 		TaskType:     request.TaskDefinition.TaskType,
