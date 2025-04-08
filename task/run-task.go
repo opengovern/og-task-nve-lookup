@@ -1014,7 +1014,7 @@ func GetVulnerabilitiesFromInlineQuery(ctx context.Context, coreServiceClient co
 	return mapCoreQueryResultToCve(queryResponse)
 }
 func mapCoreQueryResultToCve(queryResponse *coreApi.RunQueryResponse) ([]string, error) {
-	var ids []string
+	idsMap := make(map[string]bool)
 	headerMap := make(map[string]int)
 	for i, h := range queryResponse.Headers {
 		headerMap[h] = i
@@ -1028,11 +1028,17 @@ func mapCoreQueryResultToCve(queryResponse *coreApi.RunQueryResponse) ([]string,
 			if val == "" {
 				continue
 			}
-			ids = append(ids, val)
+			idsMap[val] = true
 		} else {
 			zap.L().Warn("Unexpected type/nil for package_name", zap.Int("row", i))
 		}
 	}
+
+	var ids []string
+	for id := range idsMap {
+		ids = append(ids, id)
+	}
+
 	return ids, nil
 }
 
