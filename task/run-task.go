@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/opengovern/og-task-nve-lookup/envs"
 	authApi "github.com/opengovern/og-util/pkg/api"
 	"github.com/opengovern/og-util/pkg/es"
 	"github.com/opengovern/og-util/pkg/httpclient"
@@ -13,6 +14,7 @@ import (
 	"github.com/opengovern/og-util/pkg/tasks"
 	coreApi "github.com/opengovern/opensecurity/services/core/api"
 	coreClient "github.com/opengovern/opensecurity/services/core/client"
+	"github.com/opengovern/opensecurity/services/tasks/db/models"
 	"github.com/opengovern/opensecurity/services/tasks/scheduler"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
@@ -296,6 +298,34 @@ func RunTask(ctx context.Context, jq *jq.JobQueue, coreServiceEndpoint string, e
 		log.Println("ERROR: No API Key defined")
 		return fmt.Errorf("ERROR: No API Key defined")
 	}
+
+	if err = checkNvdApiKeyHealth(ctx, apiKey, httpClient, time.Duration(cfg.RequestTimeoutSec)*time.Second); err != nil {
+		tmp := models.TaskSecretHealthStatusUnhealthy
+		response.CredentialsHealthStatus = &tmp
+		responseJson, err := json.Marshal(response)
+		if err != nil {
+			log.Printf("failed to create response json: %v", zap.Error(err))
+			return err
+		}
+
+		if _, err = jq.Produce(ctx, envs.ResultTopicName, responseJson, fmt.Sprintf("task-run-inprogress-%d", request.TaskDefinition.RunID)); err != nil {
+			log.Printf("failed to publish job in progress", zap.String("response", string(responseJson)), zap.Error(err))
+		}
+		return err
+	} else {
+		tmp := models.TaskSecretHealthStatusHealthy
+		response.CredentialsHealthStatus = &tmp
+		responseJson, err := json.Marshal(response)
+		if err != nil {
+			log.Printf("failed to create response json: %v", zap.Error(err))
+			return err
+		}
+
+		if _, err = jq.Produce(ctx, envs.ResultTopicName, responseJson, fmt.Sprintf("task-run-inprogress-%d", request.TaskDefinition.RunID)); err != nil {
+			log.Printf("failed to publish job in progress", zap.String("response", string(responseJson)), zap.Error(err))
+		}
+	}
+
 	cveIDs := getAndValidateCVEInput(rawCveIDs)
 	if len(cveIDs) == 0 {
 		log.Println("INFO: No valid CVE IDs to process. Exiting.")
@@ -927,4 +957,90 @@ func getIntParam(params map[string]any, key string, defaultValue int) int {
 		}
 	}
 	return defaultValue
+}
+
+func checkNvdApiKeyHealth(ctx context.Context, apiKey string, httpClient *http.Client, timeout time.Duration) error {
+	logPrefix := "[API Key Health Check]"
+	// Use a CVE ID format that is highly unlikely to ever exist
+	testCveID := "CVE-0000-0000"
+	apiURL := fmt.Sprintf("%s?cveId=%s", nvdBaseURL, testCveID)
+	// Use the provided timeout directly
+	configuredTimeout := timeout
+
+	// Create a context specifically for this health check request
+	reqCtx, cancelReq := context.WithTimeout(ctx, configuredTimeout)
+	defer cancelReq() // Ensure cancellation is called
+
+	req, err := http.NewRequestWithContext(reqCtx, "GET", apiURL, nil)
+	if err != nil {
+		return fmt.Errorf("%s failed to create request: %w", logPrefix, err)
+	}
+
+	// Add API key header ONLY if a key is provided.
+	if apiKey != "" {
+		req.Header.Add("apiKey", apiKey)
+		log.Printf("DEBUG: %s Testing with provided API Key.", logPrefix)
+	} else {
+		log.Printf("DEBUG: %s Testing without API Key (anonymous access).", logPrefix)
+	}
+	req.Header.Add("User-Agent", userAgent) // Assumes userAgent is initialized globally
+
+	log.Printf("INFO: %s Sending request to NVD API (timeout: %v)", logPrefix, configuredTimeout)
+	resp, err := httpClient.Do(req) // Assumes httpClient is initialized globally
+
+	// --- Analyze errors from httpClient.Do ---
+	if err != nil {
+		// Check if the error is due to the request context's deadline
+		if errors.Is(err, context.DeadlineExceeded) {
+			// Use the passed timeout value in the error message
+			timeoutErr := fmt.Errorf("%s request timeout (%v) exceeded: %w", logPrefix, configuredTimeout, err)
+			log.Printf("WARN: %v", timeoutErr)
+			return timeoutErr
+		}
+		// Check if the error is due to parent context cancellation
+		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
+			log.Printf("WARN: %s Parent context cancelled during request: %v", logPrefix, ctx.Err())
+			return ctx.Err() // Return parent context error
+		}
+		// Other network/client errors
+		execErr := fmt.Errorf("%s request execution failed: %w", logPrefix, err)
+		log.Printf("WARN: %v", execErr)
+		return execErr
+	}
+
+	// Ensure the response body is always closed
+	defer resp.Body.Close()
+
+	statusCode := resp.StatusCode
+	log.Printf("DEBUG: %s Received NVD response status: %d", logPrefix, statusCode)
+
+	// --- Analyze Status Codes ---
+	switch statusCode {
+	case http.StatusOK:
+		log.Printf("WARN: %s Received status 200 OK for non-existent CVE %s. Assuming API key is functional, but behavior is unexpected.", logPrefix, testCveID)
+		return nil
+	case http.StatusNotFound:
+		log.Printf("INFO: %s Received status 404 Not Found (expected). API key appears valid and NVD API is reachable.", logPrefix)
+		return nil // Healthy
+	case http.StatusForbidden:
+		err := fmt.Errorf("%s received status 403 Forbidden. API key is likely invalid or expired", logPrefix)
+		log.Printf("ERROR: %v", err)
+		return err // Unhealthy credentials
+	case http.StatusTooManyRequests:
+		err := fmt.Errorf("%s received status 429 Too Many Requests. Rate limited, cannot confirm key validity", logPrefix)
+		log.Printf("WARN: %v", err)
+		return err // Cannot confirm health
+	case http.StatusInternalServerError:
+		err := fmt.Errorf("%s received status 500 Internal Server Error. NVD API server issue", logPrefix)
+		log.Printf("WARN: %v", err)
+		return err // Cannot confirm health due to server issue
+	case http.StatusServiceUnavailable:
+		err := fmt.Errorf("%s received status 503 Service Unavailable. NVD API server issue", logPrefix)
+		log.Printf("WARN: %v", err)
+		return err // Cannot confirm health due to server issue
+	default:
+		err := fmt.Errorf("%s received unexpected status code %d", logPrefix, statusCode)
+		log.Printf("WARN: %v", err)
+		return err // Cannot confirm health
+	}
 }

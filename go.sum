@@ -751,6 +751,8 @@ github.com/opengovern/og-util v1.14.2 h1:BJyZy5Gw39qhpAQRfnheJo3lbBENicwjQSliVgA
 github.com/opengovern/og-util v1.14.2/go.mod h1:9uNpGalixRoQkUzPPBdT+JG1epg8FTRx/qmkfTyUZHE=
 github.com/opengovern/opensecurity v0.0.0-20250328105338-c1615913d6ee h1:LZFl/oKK5AB8na0oBXqBLKNyoFWGbOiWF7m+67XOG0U=
 github.com/opengovern/opensecurity v0.0.0-20250328105338-c1615913d6ee/go.mod h1:+/hQxFT5mxQnI9p01GSLbUos0ZVFp7nS08x1Yyiy9aY=
+github.com/opengovern/opensecurity v0.0.0-20250409143052-53a95d2fcb8b h1:4uiLnZJtkwiYh6rpgUm2uZb8Ga0zFH0Ot/8exA+wkAQ=
+github.com/opengovern/opensecurity v0.0.0-20250409143052-53a95d2fcb8b/go.mod h1:+/hQxFT5mxQnI9p01GSLbUos0ZVFp7nS08x1Yyiy9aY=
 github.com/opensearch-project/opensearch-go/v2 v2.3.0 h1:nQIEMr+A92CkhHrZgUhcfsrZjibvB3APXf2a1VwCmMQ=
 github.com/opensearch-project/opensearch-go/v2 v2.3.0/go.mod h1:8LDr9FCgUTVoT+5ESjc2+iaZuldqE+23Iq0r1XeNue8=
 github.com/pelletier/go-toml v1.9.5 h1:4yBQzkHv+7BHq2PQUZF3Mx0IYxG7LsP222s7Agd3ve8=
