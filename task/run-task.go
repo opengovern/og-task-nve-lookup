@@ -962,7 +962,7 @@ func getIntParam(params map[string]any, key string, defaultValue int) int {
 func checkNvdApiKeyHealth(ctx context.Context, apiKey string, httpClient *http.Client, timeout time.Duration) error {
 	logPrefix := "[API Key Health Check]"
 	// Use a CVE ID format that is highly unlikely to ever exist
-	testCveID := "CVE-0000-0000"
+	testCveID := "CVE-2010-0001"
 	apiURL := fmt.Sprintf("%s?cveId=%s", nvdBaseURL, testCveID)
 	// Use the provided timeout directly
 	configuredTimeout := timeout
@@ -1021,7 +1021,7 @@ func checkNvdApiKeyHealth(ctx context.Context, apiKey string, httpClient *http.C
 		return nil
 	case http.StatusNotFound:
 		log.Printf("INFO: %s Received status 404 Not Found (expected). API key appears valid and NVD API is reachable.", logPrefix)
-		return nil // Healthy
+		return fmt.Errorf("API Key not found")
 	case http.StatusForbidden:
 		err := fmt.Errorf("%s received status 403 Forbidden. API key is likely invalid or expired", logPrefix)
 		log.Printf("ERROR: %v", err)
