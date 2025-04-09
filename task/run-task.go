@@ -288,12 +288,18 @@ func RunTask(ctx context.Context, jq *jq.JobQueue, coreServiceEndpoint string, e
 		return err
 	}
 
+	var apiKey string
 	log.Printf("INFO: %s starting (version %s)", appName, appVersion)
-	apiKey := "3cdacd44-7beb-4282-b836-7ad567c68147"
+	if apiKeyTmp, ok := request.TaskDefinition.Params["nve_api_key"].(string); ok && apiKeyTmp != "" {
+		apiKey = apiKeyTmp
+	} else {
+		log.Println("ERROR: No API Key defined")
+		return fmt.Errorf("ERROR: No API Key defined")
+	}
 	cveIDs := getAndValidateCVEInput(rawCveIDs)
 	if len(cveIDs) == 0 {
 		log.Println("INFO: No valid CVE IDs to process. Exiting.")
-		os.Exit(0)
+		return nil
 	}
 	log.Printf("INFO: Processing %d validated CVE IDs", len(cveIDs))
 	limit := rate.Limit(cfg.RateLimitRequests / float64(cfg.RateLimitPeriodSec))
