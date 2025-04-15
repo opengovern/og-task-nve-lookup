@@ -919,11 +919,11 @@ func sendCveDetails(esClient og_es_sdk.Client, request tasks.TaskRequest, r *Tar
 		return nil
 	}
 	esResult := &es.TaskResult{
-		PlatformID:   fmt.Sprintf("%s:::%s:::%s", request.TaskDefinition.TaskType, request.TaskDefinition.ResultType, r.UniqueID()),
+		PlatformID:   fmt.Sprintf("%s:::%s:::%s", request.TaskDefinition.TaskType, "cve_details", r.UniqueID()),
 		ResourceID:   r.UniqueID(),
 		ResourceName: r.ID,
 		Description:  r, // Embed the full SbomVulnerabilities struct
-		ResultType:   strings.ToLower(request.TaskDefinition.ResultType),
+		ResultType:   strings.ToLower("cve_details"),
 		TaskType:     request.TaskDefinition.TaskType,
 		Metadata:     nil, // Consider adding params map here? request.TaskDefinition.Params,
 		DescribedAt:  time.Now().Unix(),

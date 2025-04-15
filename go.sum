@@ -749,6 +749,8 @@ github.com/olekukonko/tablewriter v0.0.5 h1:P2Ga83D34wi1o9J6Wh1mRuqd4mF/x/lgBS7N
 github.com/olekukonko/tablewriter v0.0.5/go.mod h1:hPp6KlRPjbx+hW8ykQs1w3UBbZlj6HuIJcUGPhkA7kY=
 github.com/opengovern/og-util v1.14.2 h1:BJyZy5Gw39qhpAQRfnheJo3lbBENicwjQSliVgAywgE=
 github.com/opengovern/og-util v1.14.2/go.mod h1:9uNpGalixRoQkUzPPBdT+JG1epg8FTRx/qmkfTyUZHE=
+github.com/opengovern/og-util v1.15.1 h1:k1pYQmmp3e/O/uMZwg2IRm6kB6uOUrPjsHcsZi7SMUA=
+github.com/opengovern/og-util v1.15.1/go.mod h1:Uel/Gln5+a7L43XQISp1gLRR0nJYKbnsgRmitPMwFLk=
 github.com/opengovern/opensecurity v0.0.0-20250328105338-c1615913d6ee h1:LZFl/oKK5AB8na0oBXqBLKNyoFWGbOiWF7m+67XOG0U=
 github.com/opengovern/opensecurity v0.0.0-20250328105338-c1615913d6ee/go.mod h1:+/hQxFT5mxQnI9p01GSLbUos0ZVFp7nS08x1Yyiy9aY=
 github.com/opengovern/opensecurity v0.0.0-20250409143052-53a95d2fcb8b h1:4uiLnZJtkwiYh6rpgUm2uZb8Ga0zFH0Ot/8exA+wkAQ=

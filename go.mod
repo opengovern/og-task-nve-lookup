@@ -4,7 +4,7 @@ go 1.23.3
 
 require (
 	github.com/nats-io/nats.go v1.38.0
-	github.com/opengovern/og-util v1.14.2
+	github.com/opengovern/og-util v1.15.1
 	github.com/opengovern/opensecurity v0.0.0-20250409143052-53a95d2fcb8b
 	github.com/opensearch-project/opensearch-go/v2 v2.3.0
 	github.com/spf13/cobra v1.8.1
