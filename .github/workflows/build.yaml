@@ -54,6 +54,35 @@ jobs:
           else
             echo "latest_tag=${{ steps.tag_version.outputs.new_tag }}" >> "$GITHUB_OUTPUT"
           fi
+      - name: Build NVELookup Plugin App
+        working-directory: ./cloudql
+        run: make build
+      - name: Pack NVELookup Plugin Build
+        working-directory: ./cloudql
+        run: |
+          tar -cvf build.tar build
+      - name: Upload NVELookup Plugin Artifact
+        uses: actions/upload-artifact@v4.6.0
+        with:
+          name: steampipe-plugin-nvelookup
+          path: ./cloudql/build.tar
+          retention-days: 1
+      - name: Create output directory
+        working-directory: .
+        run: mkdir -p nvelookup-plugin
+      - name: Copy steampipe plugin to output directory
+        working-directory: .
+        run: cp ./cloudql/build/steampipe-plugin-nvelookup.plugin ./nvelookup-plugin/cloudql-plugin
+      - name: Pack output
+        working-directory: .
+        run: |
+          tar -czf nvelookup-plugin.tar nvelookup-plugin
+      - name: Upload nvelookup outputs artifact
+        uses: actions/upload-artifact@v4.6.0
+        with:
+          name: nvelookup-plugins
+          path: ./nvelookup-plugin.tar
+          retention-days: 1
 
   deploy-task:
     needs: build
@@ -92,3 +121,30 @@ jobs:
             ghcr.io/${{ github.repository_owner }}/og-task-nve-lookup:${{ needs.build.outputs.latest_tag }}
           file: Dockerfile
           context: .
+  release-task-plugin:
+    needs:
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+    environment: main
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      - name: Download Integration Plugin Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: nvelookup-plugins
+      - name: Unpack Integration Plugin Artifact
+        run: |
+          tar -xvf nvelookup-plugin.tar
+      - name: Pack folder content into a zip file for release
+        run: |
+          cd nvelookup-plugin
+          zip -r nvelookup-plugin.zip .
+      - name: Release Integration Plugin
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ./nvelookup-plugin/nvelookup-plugin.zip
+          tag_name: ${{ needs.build.outputs.latest_tag }}
