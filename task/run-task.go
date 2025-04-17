@@ -279,9 +279,13 @@ func RunTask(ctx context.Context, jq *jq.JobQueue, coreServiceEndpoint string, e
 	inventoryClient := coreClient.NewCoreServiceClient(coreServiceEndpoint)
 
 	if queryID, ok := request.TaskDefinition.Params["query_id"].(string); ok && queryID != "" {
-		rawCveIDs, err = GetVulnerabilitiesFromQueryID(ctx, inventoryClient, request.TaskDefinition.Params)
+		rawCveIDs, err = WithRetry(func() ([]string, error) {
+			return GetVulnerabilitiesFromQueryID(ctx, inventoryClient, request.TaskDefinition.Params)
+		})
 	} else if queryExec, ok := request.TaskDefinition.Params["query_to_execute"].(string); ok && queryExec != "" {
-		rawCveIDs, err = GetVulnerabilitiesFromInlineQuery(ctx, inventoryClient, request.TaskDefinition.Params)
+		rawCveIDs, err = WithRetry(func() ([]string, error) {
+			return GetVulnerabilitiesFromInlineQuery(ctx, inventoryClient, request.TaskDefinition.Params)
+		})
 	} else {
 		err = fmt.Errorf("SBOM source query not provided (missing 'query_id' or 'query_to_execute' in params)")
 	}
