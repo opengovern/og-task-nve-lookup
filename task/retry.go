@@ -1,7 +1,6 @@
 package task
 
 import (
-	"strings"
 	"time"
 )
 
@@ -21,14 +20,8 @@ func WithRetry(fetchFunc func() ([]string, error)) ([]string, error) {
 			return result, nil
 		}
 
-		// Check if it's a connection refused error
-		if strings.Contains(err.Error(), connectionRefused) {
-			time.Sleep(retryDelay)
-			continue
-		}
-
-		// If it's not a connection refused, don't retry
-		break
+		time.Sleep(retryDelay)
+		continue
 	}
 	return nil, err
 }
