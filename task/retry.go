@@ -5,7 +5,7 @@ import (
 )
 
 const (
-	maxRetries        = 5
+	maxRetries        = 10
 	retryDelay        = 10 * time.Second
 	connectionRefused = "connect: connection refused"
 )
